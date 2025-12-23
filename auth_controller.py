@@ -445,7 +445,7 @@ class AuthController:
         try:
             query = """
             INSERT INTO audit_logs 
-            (user_id, action_type, module, details, status, action_timestamp)
+            (user_id, action_type, module, change_summary, status, action_timestamp)
             VALUES (?, ?, ?, ?, ?, ?)
             """
             
@@ -1015,7 +1015,7 @@ class HRController:
         try:
             query = """
             INSERT INTO audit_logs 
-            (user_id, action_type, module, details, status, action_timestamp)
+            (user_id, action_type, module, change_summary, status, action_timestamp)
             VALUES (?, ?, ?, ?, ?, ?)
             """
             

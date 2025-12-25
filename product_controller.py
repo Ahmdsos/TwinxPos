@@ -91,7 +91,7 @@ class ProductController:
                 values = []
                 
                 for col in product_columns:
-                    if col in product_data:
+                    if col in product_data and product_data[col] is not None:
                         columns.append(col)
                         placeholders.append('?')
                         values.append(product_data[col])
@@ -126,8 +126,9 @@ class ProductController:
                 # Log audit event
                 self._log_audit_event(
                     user_id=product_data.get('created_by'),
-                    action='create_product',
-                    module='products',
+                    action='create',
+                    entity_type='products',
+                    entity_id=product_id,
                     details=f'Created product {product_id}: {product_data["name"]}',
                     status='success'
                 )
@@ -142,8 +143,9 @@ class ProductController:
             # Log error
             self._log_audit_event(
                 user_id=product_data.get('created_by'),
-                action='create_product',
-                module='products',
+                action='create',
+                entity_type='products',
+                entity_id=None,
                 details=f'Product creation error: {str(e)}',
                 status='failure'
             )
@@ -578,8 +580,9 @@ class ProductController:
                 # Log audit event
                 self._log_audit_event(
                     user_id=user_id,
-                    action='update_stock',
-                    module='inventory',
+                    action='update',
+                    entity_type='stock_movements',
+                    entity_id=movement_id,
                     details=f'Stock updated for variation {variation_id}: {qty_change} ({reason})',
                     status='success'
                 )
@@ -598,8 +601,9 @@ class ProductController:
             # Log error
             self._log_audit_event(
                 user_id=user_id,
-                action='update_stock',
-                module='inventory',
+                action='update',
+                entity_type='stock_movements',
+                entity_id=None,
                 details=f'Stock update error for variation {variation_id}: {str(e)}',
                 status='failure'
             )
@@ -618,23 +622,23 @@ class ProductController:
             direction: 'incoming' or 'outgoing'
             
         Returns:
-            Movement type string
+            Movement type string (must match database constraint)
         """
         reason_lower = reason.lower()
         
         if direction == 'incoming':
             if 'purchase' in reason_lower:
                 return 'purchase'
-            elif 'return' in reason_lower:
+            elif 'return' in reason_lower and 'customer' in reason_lower:
                 return 'return_customer'
-            elif 'adjustment' in reason_lower and 'positive' in reason_lower:
-                return 'adjustment'
             elif 'found' in reason_lower:
                 return 'found'
             elif 'transfer' in reason_lower:
                 return 'transfer_in'
+            elif 'production' in reason_lower:
+                return 'production'
             else:
-                return 'adjustment'
+                return 'adjustment'  # Valid type
         else:  # outgoing
             if 'sale' in reason_lower:
                 return 'sale'
@@ -644,16 +648,16 @@ class ProductController:
                 return 'damage'
             elif 'expiry' in reason_lower:
                 return 'expiry'
-            elif 'adjustment' in reason_lower and 'negative' in reason_lower:
-                return 'adjustment'
             elif 'lost' in reason_lower:
                 return 'lost'
             elif 'transfer' in reason_lower:
                 return 'transfer_out'
+            elif 'write_off' in reason_lower:
+                return 'write_off'
             else:
-                return 'adjustment'
+                return 'adjustment'  # Valid type
     
-    def search_products(self, query: str, category_id: int = None, 
+    def search_products(self, query: str = "", category_id: int = None, 
                        brand: str = None, in_stock_only: bool = False,
                        limit: int = 50, offset: int = 0) -> Dict[str, Any]:
         """
@@ -771,7 +775,8 @@ class ProductController:
             """
             
             # Remove ordering and pagination from params for count query
-            count_params = params[:-3] if query else params[:-2]
+            # Remove the last 3 params (search_prefix, limit, offset)
+            count_params = params[:-3]
             count_result = self.db.execute_query(count_query, tuple(count_params))
             total_count = count_result[0]['total_count'] if count_result else 0
             
@@ -849,11 +854,7 @@ class ProductController:
                         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                         """
                         
-                        movement_type = 'adjustment'
-                        if qty_change > 0:
-                            movement_type = 'adjustment'
-                        else:
-                            movement_type = 'adjustment'
+                        movement_type = 'adjustment'  # Valid type
                         
                         cursor.execute(movement_query, (
                             variation_id, movement_type, abs(qty_change),
@@ -884,8 +885,9 @@ class ProductController:
             # Log audit event
             self._log_audit_event(
                 user_id=user_id,
-                action='bulk_update_stock',
-                module='inventory',
+                action='update',
+                entity_type='stock_movements',
+                entity_id=None,
                 details=f'Bulk stock update: {len(results)} successful, {len(failed_updates)} failed',
                 status='success' if not failed_updates else 'partial'
             )
@@ -901,8 +903,9 @@ class ProductController:
         except Exception as e:
             self._log_audit_event(
                 user_id=user_id,
-                action='bulk_update_stock',
-                module='inventory',
+                action='update',
+                entity_type='stock_movements',
+                entity_id=None,
                 details=f'Bulk stock update error: {str(e)}',
                 status='failure'
             )
@@ -1011,31 +1014,402 @@ class ProductController:
         suffix = str(uuid.uuid4().int)[:6]
         return f"{prefix}-{suffix}"
     
-    def _log_audit_event(self, user_id: int, action: str, module: str, 
-                        details: str, status: str = 'success') -> None:
+    def _log_audit_event(self, user_id: int, action: str, entity_type: str, 
+                        entity_id: Optional[int], details: str, status: str = 'success') -> None:
         """
         Log event to audit_logs table.
         
         Args:
             user_id: User ID
-            action: Action performed
-            module: Module where action occurred
-            details: Detailed description
+            action: Action performed (must be: create, read, update, delete, login, logout, export, import, print, approve, reject)
+            entity_type: Entity type (table name)
+            entity_id: Entity ID
+            details: Detailed description (will be stored in change_summary)
             status: Success/failure status
         """
         try:
             query = """
             INSERT INTO audit_logs 
-            (user_id, action_type, module, details, status, action_timestamp)
-            VALUES (?, ?, ?, ?, ?, ?)
+            (user_id, action_type, module, entity_type, entity_id, change_summary, status, action_timestamp)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
             """
             
+            # Use entity_type for both module and entity_type for now
             self.db.execute_update(query, (
-                user_id, action, module, details, status, datetime.now()
+                user_id, action, entity_type, entity_type, entity_id, details, status, datetime.now()
             ))
         except Exception as e:
             print(f"Error logging audit event: {e}")
-
+    def update_product(self, product_id: int, product_data: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Update an existing product.
+        
+        Args:
+            product_id: Product ID to update
+            product_data: Dictionary with updated product details
+            
+        Returns:
+            Dictionary with success status
+        """
+        try:
+            # Start transaction
+            with self.db.get_connection() as conn:
+                cursor = conn.cursor()
+                
+                # Check if product exists
+                check_query = "SELECT id FROM products WHERE id = ?"
+                cursor.execute(check_query, (product_id,))
+                if not cursor.fetchone():
+                    return {
+                        'success': False,
+                        'message': 'Product not found'
+                    }
+                
+                # Build update query
+                update_fields = []
+                values = []
+                
+                # Allowed fields to update
+                allowed_fields = [
+                    'name', 'category', 'subcategory', 'brand', 'description',
+                    'short_description', 'price', 'cost_price', 'wholesale_price',
+                    'suggested_retail_price', 'tax_class', 'tax_rate', 'sku',
+                    'barcode', 'weight_kg', 'length_cm', 'width_cm', 'height_cm',
+                    'manufacturer', 'country_of_origin', 'warranty_period_months',
+                    'has_warranty', 'support_email', 'support_phone',
+                    'min_order_quantity', 'max_order_quantity', 'is_active',
+                    'is_featured', 'stock_quantity', 'low_stock_threshold',
+                    'updated_by'
+                ]
+                
+                for field in allowed_fields:
+                    if field in product_data:
+                        update_fields.append(f"{field} = ?")
+                        values.append(product_data[field])
+                
+                # Add updated_at timestamp
+                update_fields.append("updated_at = ?")
+                values.append(datetime.now())
+                
+                # Add product_id for WHERE clause
+                values.append(product_id)
+                
+                # Execute update
+                update_query = f"""
+                UPDATE products 
+                SET {', '.join(update_fields)}
+                WHERE id = ?
+                """
+                
+                cursor.execute(update_query, tuple(values))
+                
+                # Commit transaction
+                conn.commit()
+                
+                # Log audit event
+                self._log_audit_event(
+                    user_id=product_data.get('updated_by'),
+                    action='update',
+                    entity_type='products',
+                    entity_id=product_id,
+                    details=f'Updated product {product_id}',
+                    status='success'
+                )
+                
+                return {
+                    'success': True,
+                    'message': 'Product updated successfully',
+                    'product_id': product_id
+                }
+                
+        except Exception as e:
+            # Log error
+            self._log_audit_event(
+                user_id=product_data.get('updated_by'),
+                action='update',
+                entity_type='products',
+                entity_id=product_id,
+                details=f'Product update error: {str(e)}',
+                status='failure'
+            )
+            
+            return {
+                'success': False,
+                'message': f'Error updating product: {str(e)}'
+            }
+    
+    def delete_product(self, product_id: int, user_id: int) -> Dict[str, Any]:
+        """
+        Soft delete a product (set is_active = 0).
+        
+        Args:
+            product_id: Product ID to delete
+            user_id: User ID performing deletion
+            
+        Returns:
+            Dictionary with success status
+        """
+        try:
+            # Start transaction
+            with self.db.get_connection() as conn:
+                cursor = conn.cursor()
+                
+                # Check if product exists
+                check_query = "SELECT id, name FROM products WHERE id = ?"
+                cursor.execute(check_query, (product_id,))
+                result = cursor.fetchone()
+                
+                if not result:
+                    return {
+                        'success': False,
+                        'message': 'Product not found'
+                    }
+                
+                product_name = result['name']
+                
+                # Soft delete product
+                delete_query = """
+                UPDATE products 
+                SET is_active = 0, updated_at = ?, updated_by = ?
+                WHERE id = ?
+                """
+                
+                cursor.execute(delete_query, (datetime.now(), user_id, product_id))
+                
+                # Also soft delete variations
+                variations_query = """
+                UPDATE product_variations 
+                SET is_active = 0, updated_at = ?
+                WHERE product_id = ?
+                """
+                
+                cursor.execute(variations_query, (datetime.now(), product_id))
+                
+                # Commit transaction
+                conn.commit()
+                
+                # Log audit event
+                self._log_audit_event(
+                    user_id=user_id,
+                    action='delete',
+                    entity_type='products',
+                    entity_id=product_id,
+                    details=f'Soft deleted product {product_id}: {product_name}',
+                    status='success'
+                )
+                
+                return {
+                    'success': True,
+                    'message': 'Product deleted successfully',
+                    'product_id': product_id
+                }
+                
+        except Exception as e:
+            # Log error
+            self._log_audit_event(
+                user_id=user_id,
+                action='delete',
+                entity_type='products',
+                entity_id=product_id,
+                details=f'Product deletion error: {str(e)}',
+                status='failure'
+            )
+            
+            return {
+                'success': False,
+                'message': f'Error deleting product: {str(e)}'
+            }
+    
+    def export_products_csv(self, file_path: str, product_ids: List[int] = None) -> Dict[str, Any]:
+        """
+        Export products to CSV file.
+        
+        Args:
+            file_path: Path to save CSV file
+            product_ids: List of product IDs to export (None = all active products)
+            
+        Returns:
+            Dictionary with success status and export stats
+        """
+        try:
+            import csv
+            
+            # Build query with optional product filter
+            if product_ids:
+                placeholders = ','.join(['?'] * len(product_ids))
+                query = f"""
+                SELECT 
+                    p.id, p.name, p.sku, p.barcode, p.type, p.category,
+                    p.brand, p.price, p.cost_price, p.stock_quantity,
+                    p.stock_status, p.low_stock_threshold, p.weight_kg,
+                    p.length_cm, p.width_cm, p.height_cm, p.manufacturer,
+                    p.country_of_origin, p.created_at, p.updated_at,
+                    COUNT(pv.id) as variation_count
+                FROM products p
+                LEFT JOIN product_variations pv ON p.id = pv.product_id AND pv.is_active = 1
+                WHERE p.id IN ({placeholders}) AND p.is_active = 1
+                GROUP BY p.id
+                ORDER BY p.name
+                """
+                params = product_ids
+            else:
+                query = """
+                SELECT 
+                    p.id, p.name, p.sku, p.barcode, p.type, p.category,
+                    p.brand, p.price, p.cost_price, p.stock_quantity,
+                    p.stock_status, p.low_stock_threshold, p.weight_kg,
+                    p.length_cm, p.width_cm, p.height_cm, p.manufacturer,
+                    p.country_of_origin, p.created_at, p.updated_at,
+                    COUNT(pv.id) as variation_count
+                FROM products p
+                LEFT JOIN product_variations pv ON p.id = pv.product_id AND pv.is_active = 1
+                WHERE p.is_active = 1
+                GROUP BY p.id
+                ORDER BY p.name
+                """
+                params = []
+            
+            # Fetch data
+            products = self.db.execute_query(query, tuple(params))
+            
+            if not products:
+                return {
+                    'success': False,
+                    'message': 'No products found to export',
+                    'exported_count': 0,
+                    'file_path': None
+                }
+            
+            # Define CSV columns
+            fieldnames = [
+                'ID', 'Name', 'SKU', 'Barcode', 'Type', 'Category',
+                'Brand', 'Price', 'Cost Price', 'Stock Quantity',
+                'Stock Status', 'Low Stock Threshold', 'Weight (kg)',
+                'Length (cm)', 'Width (cm)', 'Height (cm)', 'Manufacturer',
+                'Country of Origin', 'Created At', 'Updated At',
+                'Variation Count'
+            ]
+            
+            # Write to CSV
+            with open(file_path, 'w', newline='', encoding='utf-8') as csvfile:
+                writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
+                writer.writeheader()
+                
+                for product in products:
+                    writer.writerow({
+                        'ID': product['id'],
+                        'Name': product['name'],
+                        'SKU': product['sku'] or '',
+                        'Barcode': product['barcode'] or '',
+                        'Type': product['type'],
+                        'Category': product['category'] or '',
+                        'Brand': product['brand'] or '',
+                        'Price': f"{product['price']:.2f}",
+                        'Cost Price': f"{product['cost_price']:.2f}" if product['cost_price'] else '',
+                        'Stock Quantity': product['stock_quantity'],
+                        'Stock Status': product['stock_status'],
+                        'Low Stock Threshold': product['low_stock_threshold'],
+                        'Weight (kg)': f"{product['weight_kg']:.3f}" if product['weight_kg'] else '',
+                        'Length (cm)': f"{product['length_cm']:.2f}" if product['length_cm'] else '',
+                        'Width (cm)': f"{product['width_cm']:.2f}" if product['width_cm'] else '',
+                        'Height (cm)': f"{product['height_cm']:.2f}" if product['height_cm'] else '',
+                        'Manufacturer': product['manufacturer'] or '',
+                        'Country of Origin': product['country_of_origin'] or '',
+                        'Created At': product['created_at'],
+                        'Updated At': product['updated_at'],
+                        'Variation Count': product['variation_count']
+                    })
+            
+            # Log audit event
+            self._log_audit_event(
+                user_id=1,  # System user ID
+                action='export',
+                entity_type='products',
+                entity_id=None,
+                details=f'Exported {len(products)} products to {file_path}',
+                status='success'
+            )
+            
+            return {
+                'success': True,
+                'message': f'Successfully exported {len(products)} products',
+                'exported_count': len(products),
+                'file_path': file_path
+            }
+            
+        except Exception as e:
+            return {
+                'success': False,
+                'message': f'Error exporting products: {str(e)}',
+                'exported_count': 0,
+                'file_path': None
+            }
+    
+    def get_product_variations(self, product_id: int) -> Dict[str, Any]:
+        """
+        Get all variations for a product.
+        
+        Args:
+            product_id: Product ID
+            
+        Returns:
+            Dictionary with variations list
+        """
+        try:
+            query = """
+            SELECT 
+                pv.id, pv.name, pv.sku, pv.barcode, pv.price,
+                pv.cost_price, pv.wholesale_price, pv.sale_price,
+                pv.stock_quantity, pv.stock_status, pv.low_stock_threshold,
+                pv.weight_kg, pv.length_cm, pv.width_cm, pv.height_cm,
+                pv.attribute_combination, pv.image_path,
+                pv.is_active, pv.is_default_variation,
+                pv.created_at, pv.updated_at
+            FROM product_variations pv
+            WHERE pv.product_id = ? AND pv.is_active = 1
+            ORDER BY 
+                pv.is_default_variation DESC,
+                pv.created_at ASC
+            """
+            
+            results = self.db.execute_query(query, (product_id,))
+            variations = []
+            
+            for row in results:
+                variation = dict(row)
+                
+                # Parse JSON fields
+                if variation.get('attribute_combination'):
+                    try:
+                        variation['attribute_combination'] = json.loads(variation['attribute_combination'])
+                    except:
+                        variation['attribute_combination'] = {}
+                
+                variations.append(variation)
+            
+            # Get parent product info for context
+            product_query = "SELECT name, sku FROM products WHERE id = ?"
+            product_result = self.db.execute_query(product_query, (product_id,))
+            product_info = dict(product_result[0]) if product_result else {}
+            
+            return {
+                'success': True,
+                'message': f'Found {len(variations)} variations',
+                'product_id': product_id,
+                'product_name': product_info.get('name', 'Unknown'),
+                'product_sku': product_info.get('sku', ''),
+                'variations': variations,
+                'variation_count': len(variations)
+            }
+            
+        except Exception as e:
+            return {
+                'success': False,
+                'message': f'Error retrieving variations: {str(e)}',
+                'product_id': product_id,
+                'variations': [],
+                'variation_count': 0
+            }
 
 # Example usage and testing
 if __name__ == "__main__":

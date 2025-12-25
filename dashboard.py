@@ -13,7 +13,7 @@ from PyQt6.QtWidgets import (
 )
 from PyQt6.QtCore import Qt, pyqtSignal
 from PyQt6.QtGui import QFont, QIcon
-
+from product_screen import ProductScreen
 # Import custom modules
 from translations import TranslationManager
 from config_manager import ConfigManager
@@ -313,9 +313,13 @@ class DashboardWindow(QMainWindow):
         pos_page = self.create_placeholder_page("point_of_sale", "💰", "#3498db")
         self.stacked_widget.addWidget(pos_page)
         
-        # Products Page
-        products_page = self.create_placeholder_page("products", "📦", "#2ecc71")
-        self.stacked_widget.addWidget(products_page)
+        # Products Page (Actual ProductScreen)
+        self.products_screen = ProductScreen(
+            db_manager=self.config_manager.db,  # Access db via config_manager
+            translation_manager=self.translation_manager
+        )
+        self.products_screen.setObjectName("page_products")
+        self.stacked_widget.addWidget(self.products_screen)
         
         # Customers Page
         customers_page = self.create_placeholder_page("customers", "👥", "#9b59b6")
@@ -523,7 +527,9 @@ class DashboardWindow(QMainWindow):
                     if obj_name.startswith("page_"):
                         screen_key = obj_name[5:]
                         title_label.setText(self.translation_manager.get(screen_key))
-        
+        # Update product screen language
+        if hasattr(self, 'products_screen'):
+            self.products_screen.update_language()
         # Apply layout direction
         self.apply_language_direction()
         

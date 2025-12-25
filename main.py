@@ -22,7 +22,7 @@ from config_manager import ConfigManager, get_config_manager
 from translations import TranslationManager, get_translator
 from styles import TwinxTheme, apply_theme
 from login_screen import LoginScreen
-
+from dashboard import DashboardWindow
 
 class MainWindow(QMainWindow):
     """Main dashboard window for Twinx POS (temporary placeholder)."""
@@ -222,7 +222,7 @@ class ApplicationController:
             self.login_screen.close()
             self.login_screen = None
         
-        self.main_window = MainWindow(user_data, self.config_manager, self.translation_manager)
+        self.main_window = DashboardWindow(user_data, self.config_manager, self.translation_manager)
         self.main_window.logout_requested.connect(self.show_login_screen)
         self.main_window.show()
         
